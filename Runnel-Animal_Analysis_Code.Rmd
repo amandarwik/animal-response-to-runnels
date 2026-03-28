@@ -1,0 +1,1281 @@
+---
+title: "Community effects of runnels - Analysis Code"
+author: "Amanda Wik and Nathalie Sommer"
+date: "Sep 10, 2025"
+---
+
+#Prepping R packages
+
+```{r load packages}
+
+library(vegan)
+library(ape)
+library(dplyr)
+library(tidyverse)
+library(textshape)
+library(knitr)
+library(ggplot2)
+library(lme4)
+library(ggeffects)  
+library(lmerTest)
+library(ggfortify)
+library(MuMIn)
+library(pbapply)
+library(AICcmodavg)
+library(rsq)
+library(gtable)
+library(gt)
+library(TMB)
+library(glmmTMB)
+library(DHARMa)
+library(ggrepel)
+library(car)
+library(lme4)
+library(betareg)
+
+```
+
+# Data cleaning
+## Inverts
+
+```{r load invertebrate data}
+
+
+combined_invert_data <- read.csv('Invertebrate_Data_2024.csv', 
+                      header=TRUE, stringsAsFactors=FALSE)
+
+# Convert character variables to factors
+combined_invert_data$Treatment <- factor(combined_invert_data$Treatment)
+combined_invert_data$Water_Level <- factor(combined_invert_data$Water_Level)
+
+#Adding Site_ID as rownames
+combined_invert_data <- combined_invert_data %>%
+  mutate(Site_ID = paste(Site, ID, sep = "")) %>% 
+  column_to_rownames("Site_ID")
+
+```
+
+```{r calculating Infauna and Epifauna abundance, richness and diversity}
+
+#Calculating Abundance (total number of invertebrates)
+combined_invert_data <- combined_invert_data %>%
+  mutate(Total_Epifauna = rowSums(across(Amphipods:Stratiomydae), na.rm = FALSE))
+combined_invert_data <- combined_invert_data %>%
+  mutate(Total_Infauna = rowSums(across(Capitella:Unknown_Infauna), na.rm = FALSE))
+
+#Calculating Richness
+combined_invert_data$Epifauna_Richness <- as.integer(specnumber(select(combined_invert_data, Amphipods:Stratiomydae)))
+combined_invert_data$Infauna_Richness <- as.integer(specnumber(select(combined_invert_data, Capitella:Unknown_Infauna)))
+
+#Calculating Shannon diversity
+combined_invert_data$Epifauna_Shannon <- diversity(select(combined_invert_data, Amphipods:Stratiomydae), index = "shannon")
+combined_invert_data$Infauna_Shannon <- diversity(select(combined_invert_data, Capitella:Unknown_Infauna), index = "shannon")
+
+```
+
+## Fish
+
+``` {r loading fish data and creating field summary data}
+
+#Loading in the fish data
+
+fish_diet_data <- read.csv('Fish_Gut_Data_2025.csv', 
+                      header=TRUE, stringsAsFactors=FALSE)
+
+
+fish_survey_data <- read.csv('Fish_Survey_Data_2024.csv', 
+                      header=TRUE, stringsAsFactors=FALSE)
+
+fish_size_data <- read.csv('Fish_Size_Data_2024.csv', 
+                      header=TRUE, stringsAsFactors=FALSE)
+
+# Convert character variables to factors
+fish_survey_data$Tide <- factor(fish_survey_data$Tide)
+fish_survey_data$Trap_Location <- factor(fish_survey_data$Trap_Location)
+fish_survey_data$Treatment <- factor(fish_survey_data$Treatment)
+fish_survey_data$Trap_Type <- factor(fish_survey_data$Trap_Type)
+
+#Combining lab and field fish data
+combined_fish_data <- merge(
+  fish_survey_data,
+  fish_diet_data,
+  by = c("Site", "ID", "Tide"),
+  all.y = TRUE
+)
+
+#Creating a dataframe of mean weight, mean length, and number of fish by trap (plot)
+fish_stats_by_plot <- fish_size_data %>%
+  group_by(Site, ID, Tide) %>%
+  mutate(
+    Mean_Weight_by_Trap = mean(Fish_Weight, na.rm = TRUE),
+    Mean_Length_by_Trap = mean(Fish_Length, na.rm = TRUE),
+    Total_Number_Fish_by_Trap = n()
+  ) %>%
+  ungroup() %>%
+  select(-Fish_ID:-Fish_Weight) %>%
+  distinct() 
+
+#Creating a dataframe of mean weight, length, and number of fish by site
+fish_stats_by_site <- fish_size_data %>%
+  group_by(Site, Tide) %>%
+  mutate(
+    Mean_Weight_by_Trap = mean(Fish_Weight, na.rm = TRUE),
+    Mean_Length_by_Trap = mean(Fish_Length, na.rm = TRUE),
+    Total_Number_Fish_by_Trap = n()
+  ) %>%
+  ungroup() %>%
+  select(-ID, -Fish_ID:-Fish_Weight) %>%
+  distinct()
+
+#Creating count data for each plot that includes zeroes where no fish were caught
+fish_field_data <- fish_survey_data %>%
+  left_join(fish_stats_by_plot %>% select(Site, ID, Tide, Total_Number_Fish_by_Trap),
+            by = c("Site", "ID", "Tide")) %>%
+  mutate(Total_Number_Fish_by_Trap = replace_na(Total_Number_Fish_by_Trap, 0))
+
+#Adding site data to fish field size dataframe
+fish_field_size_data <- fish_size_data %>%
+  left_join(fish_survey_data %>% select(Site:Treatment),
+            by = c("Site", "ID", "Tide")) 
+
+```
+
+```{r Prepping fish diet data, adding richness, diversity, and other columns}
+
+#Adding total crab column
+combined_fish_data <- combined_fish_data %>%
+  mutate(Total_Crab = Crabs_Whole + Crab_Parts)
+
+# Calculate species richness
+combined_fish_data$Diet_Richness <- specnumber(select(combined_fish_data, c(Algae:Beetle_Larvae, Diptera:Total_Crab)))
+
+# Calculate Shannon diversity
+combined_fish_data$Diet_Diversity_Shannon <- combined_fish_data %>%
+  select(Algae:Beetle_Larvae, Diptera:Total_Crab) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix() %>%
+  diversity(index = "shannon")
+
+#Adding Fish IDs as row names
+combined_fish_data <- combined_fish_data %>%
+  mutate(Site_ID_Tide_Fish = paste(Site, ID, Tide, Fish_ID, sep = "")) %>% 
+  column_to_rownames("Site_ID_Tide_Fish")
+
+```
+
+```{r data preparation - excluding runnel traps}
+
+# Some traps were placed inside runnels for the restored sites, so creating a data frame that only includes traps placed on the marsh platform
+
+fish_field_data_no_traps_in_runnels <- fish_field_data %>% filter(Trap_Location != "Runnel")
+fish_field_size_data_no_traps_in_runnels <- fish_field_size_data %>% filter(Trap_Location != "Runnel")
+
+# Checking the distribution of traps
+
+table(fish_field_data_no_traps_in_runnels$Trap_Type, fish_field_data_no_traps_in_runnels$Treatment)
+table(fish_field_data_no_traps_in_runnels$Trap_Type, fish_field_data_no_traps_in_runnels$Trap_Location)
+
+# Summary
+cat("Data structure for main analyses (excluding traps in runnels):\n")
+cat("Total observations:", nrow(fish_field_data_no_traps_in_runnels), "\n")
+cat("Runnel sites:", sum(fish_field_data_no_traps_in_runnels$Treatment == "Runnel"), "\n")
+cat("Non-runnel sites:", sum(fish_field_data_no_traps_in_runnels$Treatment == "Control"), "\n")
+
+```
+
+#Epifauna NMDS
+
+```{r Epi: prepping the data for NMDS}
+
+# Separating environmental data and species data; first is creating a species dataframe
+epifauna_spp <- combined_invert_data %>% select(Amphipods:Stratiomydae)
+# Removing row LBSC6 because it contains only zeroes
+epifauna_spp <- epifauna_spp[!rownames(epifauna_spp) %in% "LBSC6", ]
+
+#Creating an environmental dataframe
+epifauna_treatment <- combined_invert_data %>% 
+  select("Site", "ID", "Treatment") %>% 
+  mutate(Site_ID = paste(Site, ID, sep = "")) %>% 
+  select(-Site, -ID)
+  
+# Removing row LBSC6 because it contains only zeroes
+epifauna_treatment <- epifauna_treatment[!rownames(epifauna_treatment) %in% "LBSC6", ]
+
+```
+
+```{r Epi: conducting the NMDS}
+# Performing nmds with environmental (treatment) and species vectors
+epifauna_mds <- metaMDS(epifauna_spp, distance = "bray", autotransform = FALSE)
+
+epifauna_sppfit <- envfit(epifauna_mds, epifauna_spp, permutations = 999) # Fit species vectors
+
+epifauna_mds  # Stress value is less than 0.2, which is good.
+
+```
+
+```{r Epi: saving the NMDS results}
+
+# Saving the results from the nmds and grouping the data by environmental variables
+epifauna_site_scrs <- as.data.frame(scores(epifauna_mds, display = "sites"))  # Saving NMDS results into data frame
+
+epifauna_site_scrs <- cbind(epifauna_site_scrs, Treatment = epifauna_treatment$Treatment) # Making treatment a grouping variable and saving to data frame
+
+```
+
+```{r Epi: creating a dataframe with the signifcant species contributions}
+
+# Saving species data from nmds to dataframe
+epifauna_spp_scrs <- as.data.frame(scores(epifauna_sppfit, display = "vectors"))  # Saving species values into dataframe
+
+epifauna_spp_scrs <- cbind(epifauna_spp_scrs, Species = rownames(epifauna_spp_scrs))  # Adding species names to dataframe
+
+epifauna_spp_scrs <- cbind(epifauna_spp_scrs, pval = epifauna_sppfit$vectors$pvals) # Adding p values to dataframe to later select species which are significant
+
+sig_epifauna_spp_scrs <- subset(epifauna_spp_scrs, pval<=0.05) # Showing only significant species (using 0.05 as cutoff)
+
+head(epifauna_spp_scrs)  # Viewing data frame
+
+```
+
+```{r Epi: PERMANOVA}
+
+# PERMANOVA (adonis2) 
+permanova_result_epifauna <- adonis2(epifauna_spp ~ Treatment, data = epifauna_treatment, permutations = 999)
+print(permanova_result_epifauna)
+
+```
+
+```{r Epi: SIMPER}
+
+# SIMPER looking for species contributing most to difference between treatment groups
+mat_bar_epifauna_spp <- as.matrix(epifauna_spp)
+simp_treatment_epifauna <- simper(mat_bar_epifauna_spp, epifauna_treatment$Treatment)
+simp_treatment_epifauna
+summary(simp_treatment_epifauna, ordered = TRUE, digits = 3)
+
+```
+
+#Infauna NMDS
+
+```{r In: prepping the data for NMDS}
+
+# Separating environmental data and species data; first is the species dataframe
+infauna_spp <- combined_invert_data %>% select(Capitella:Unknown_Infauna) %>% na.omit() 
+rows_to_remove <- c("LBSL3", "LBNE4", "LBNG6", "LBSC1", "LBSC2", "LBSC3")  # Adding all the row names to be removed here because of zeroes
+infauna_spp <- infauna_spp[!rownames(infauna_spp) %in% rows_to_remove, ] # Removing those rows
+
+# Now making the treatment dataframe
+infauna_treatment <- combined_invert_data %>% 
+  drop_na(Total_Infauna) %>% 
+  select("Site","ID","Treatment") %>% 
+  mutate(Site_ID = paste(Site, ID, sep = "")) %>% 
+  select(-Site, -ID) 
+
+# Removing rows with all zeroes
+infauna_treatment <- infauna_treatment[!rownames(infauna_treatment) %in% rows_to_remove, ]
+
+```
+
+```{r In: conducting the NMDS}
+# Performing nmds with environmental (treatment) and species vectors
+infauna_mds <- metaMDS(infauna_spp, distance = "bray", autotransform = FALSE)
+
+infauna_sppfit <- envfit(infauna_mds, infauna_spp, permutations = 999) # Fitting species vectors
+
+infauna_mds  # Stress value is less than 0.2 (0.1293137), which is good. Shows how easy it was to condense multidimensional data into two dimensional space
+
+```
+
+```{r In: saving the NMDS results}
+
+# Saving the results from the nmds and grouping the data by environmental variables
+infauna_site_scrs <- as.data.frame(scores(infauna_mds, display = "sites"))  # Saving NMDS results into dataframe
+infauna_site_scrs <- cbind(infauna_site_scrs, Treatment = infauna_treatment$Treatment)  # Making treatment a grouping variable and saving to dataframe
+
+head(infauna_site_scrs)  # Viewing the dataframe
+
+```
+
+```{r In: creating a data frame with the signifcant species contributions}
+
+# Saving species data from nmds to dataframe
+infauna_spp_scrs <- as.data.frame(scores(infauna_sppfit, display = "vectors"))  # Saving species values into dataframe
+infauna_spp_scrs <- cbind(infauna_spp_scrs, Species = rownames(infauna_spp_scrs))  # Adding species names to dataframe
+infauna_spp_scrs <- cbind(infauna_spp_scrs, pval = infauna_sppfit$vectors$pvals) # Adding p values to dataframe to select species which are significant
+sig_infauna_spp_scrs <- subset(infauna_spp_scrs, pval<=0.05) # Showing only significant species (using 0.05 as cutoff)
+head(infauna_spp_scrs)  # Viewing dataframe
+
+```
+
+
+```{r In: PERMANOVA}
+
+# PERMANOVA (adonis2) 
+permanova_result_infauna <- adonis2(infauna_spp ~ Treatment, data = infauna_treatment, permutations = 999)
+print(permanova_result_infauna)
+
+```
+
+```{r In: SIMPER}
+
+# SIMPER looking for species contributing most to difference between treatment groups
+mat_bar_infauna_spp <- as.matrix(infauna_spp)
+simp_treatment_infauna <- simper(mat_bar_infauna_spp, infauna_treatment$Treatment)
+simp_treatment_infauna
+summary(simp_treatment_infauna, ordered = TRUE, digits = 3)
+
+```
+
+#Invertebrate Abundance
+```{r glmmTMB modelling (nbinomial) for total epifauna}
+
+#epifauna model
+
+epi_number_glmmtmb <- glmmTMB(Total_Epifauna ~ Treatment + Water_Level + Veg_Cover + (1 | Site),
+                               data = combined_invert_data,
+                               family = nbinom2(link = "log"))
+
+#Checking the residuals to see if the q-q plot looks okay, and to see if there is any heteroscedasticity
+simulateResiduals(epi_number_glmmtmb, plot=TRUE)
+
+#Checking the results and estimates
+summary(epi_number_glmmtmb)
+confint(epi_number_glmmtmb)
+r.squaredGLMM(epi_number_glmmtmb)
+
+```
+
+```{r glmmTMB modelling (nbinomial) for total infauna}
+
+#infauna model
+
+in_number_glmmtmb <- glmmTMB(Total_Infauna ~ Treatment + Water_Level + Veg_Cover + (1 | Site),
+                               data = combined_invert_data,
+                               family = nbinom2(link = "log"))
+
+#Checking the residuals to see if the q-q plot looks okay,and if there is any heteroscedasticity
+simulateResiduals(in_number_glmmtmb, plot=TRUE)
+
+#Checking the results and estimates
+summary(in_number_glmmtmb)
+confint(in_number_glmmtmb)
+r.squaredGLMM(in_number_glmmtmb)
+
+```
+
+#Invertebrate Richness
+```{r glmmTMB modelling for epifauna richness}
+
+# Check VIF for fixed effects
+vif_model <- lm(Epifauna_Richness ~ Treatment + Water_Level + Veg_Cover, 
+                data = combined_invert_data)
+vif(vif_model) # these are very low, so this is good
+
+# Conway-Maxwell-Poisson model for underdispersion
+epi_richness_model <- glmmTMB(Epifauna_Richness ~ Treatment + Water_Level + Veg_Cover + (1 | Site),
+                             data = combined_invert_data,
+                             family = compois(link = "log"))
+
+# Model diagnostics
+model_resids <- simulateResiduals(epi_richness_model, plot = TRUE) # not perfect but acceptable
+
+# Additional diagnostic tests
+testDispersion(model_resids) #non-significant p-value is good
+testZeroInflation(model_resids) #non-significant p-value is good
+testOutliers(model_resids) #outlier test is non-significant
+
+# Diagnostic plots
+plot(model_resids$scaledResiduals ~ combined_invert_data$Veg_Cover,
+     xlab = "Vegetation Cover (%)", ylab = "Scaled Residuals")
+plot(model_resids$scaledResiduals ~ as.factor(combined_invert_data$Treatment),
+     xlab = "Runnel", ylab = "Scaled Residuals")
+plot(model_resids$scaledResiduals ~ as.factor(combined_invert_data$Water_Level),
+     xlab = "Water_Level", ylab = "Scaled Residuals")
+
+# Model summary and checks
+summary(epi_richness_model)
+confint(epi_richness_model)
+r.squaredGLMM(epi_richness_model)
+
+
+```
+
+```{r glmmTMB for infauna richness}
+
+# Check VIF for fixed effects
+vif_model <- lm(Infauna_Richness ~ Treatment + Water_Level + Veg_Cover, 
+                data = combined_invert_data)
+vif(vif_model) # Very low (around 1) so these are good
+
+# Conway-Maxwell-Poisson model for underdispersion
+inf_richness_model <- glmmTMB(Infauna_Richness ~ Treatment + Water_Level + Veg_Cover + (1 | Site),
+                             data = combined_invert_data,
+                             family = compois(link = "log"))
+
+# Model diagnostics
+model_resids <- simulateResiduals(inf_richness_model, plot = TRUE) #both plots look good
+
+# Additional diagnostic tests
+testDispersion(model_resids) #non-significant
+testZeroInflation(model_resids) #non-significant
+testOutliers(model_resids) #no significant outliers
+
+# Diagnostic plots - modified slightly to handle an NA
+model_data <- model.frame(inf_richness_model)
+plot_data <- data.frame(
+  residuals = model_resids$scaledResiduals,
+  veg_cover = model_data$Veg_Cover,
+  treatment = model_data$Treatment,
+  Water_Level = model_data$Water_Level
+)
+
+# Plot residuals vs vegetation cover
+plot(plot_data$residuals ~ plot_data$veg_cover,
+     xlab = "Vegetation Cover (%)", 
+     ylab = "Scaled Residuals")
+
+# Plot residuals vs runnel
+boxplot(plot_data$residuals ~ as.factor(plot_data$treatment),
+        xlab = "Treatment", 
+        ylab = "Scaled Residuals")
+
+# Plot residuals vs Water_Level
+boxplot(plot_data$residuals ~ as.factor(plot_data$Water_Level),
+        xlab = "Water_Level", 
+        ylab = "Scaled Residuals")
+
+# Model summary and checks
+summary(inf_richness_model)
+confint(inf_richness_model)
+r.squaredGLMM(inf_richness_model)
+
+```
+
+#Invertebrate Diversity
+```{r lme4 modelling for epifauna diversity}
+
+epi_diversity_model <- lme4::lmer(Epifauna_Shannon ~ 
+                                    Treatment + 
+                                    Water_Level + 
+                                    Veg_Cover + 
+                                    (1 | Site),
+                           data = combined_invert_data)
+
+# Model diagnostics using DHARMa
+model_resids <- simulateResiduals(epi_diversity_model, plot = TRUE) #Not looking good.
+
+# Additional diagnostic tests
+testDispersion(model_resids)
+testZeroInflation(model_resids) # zero-inflated
+testOutliers(model_resids)
+
+#Moving on to using nonparametric bootstrapping
+
+# Standard confidence intervals
+cat("\nStandard Confidence Intervals:\n")
+confint(epi_diversity_model)
+
+# Bootstrapped confidence intervals
+cat("\nBootstrapped Confidence Intervals:\n")
+set.seed(123) # for reproducibility 
+boot_ci <- confint(epi_diversity_model, method="boot", nsim=1000)
+print(boot_ci)
+# Note: Singular fit warnings in some bootstrap samples, but similar confidence intervals to standard method, and we don't see any change in the overlap with zero (i.e. did not previously overlap with zero and now does). 
+# Suggests stable parameter estimates
+
+# Variance components interpretation:
+# .sig01: Random effect std dev (Site) confidence intervals includes 0 [0.067, 0.37] suggesting minimal site-level variation
+# .sigma: Residual std dev. confidence interval [0.27, 0.37] represents unexplained variation within sites
+
+# Compare standard vs bootstrapped intervals
+cat("\nComparison of Confidence Intervals:\n")
+ci_comparison <- data.frame(
+  Parameter = rownames(boot_ci),
+  Standard_Lower = confint(epi_diversity_model)[,1],
+  Standard_Upper = confint(epi_diversity_model)[,2],
+  Boot_Lower = boot_ci[,1],
+  Boot_Upper = boot_ci[,2]
+)
+print(ci_comparison) #As noted before, the confidence intervals are similar which is good
+
+
+# Model summary
+summary(epi_diversity_model)
+
+# Get p-values for fixed effects
+summary(as_lmerModLmerTest(epi_diversity_model))  # converts to lmerTest object
+
+# R-squared
+r.squaredGLMM(epi_diversity_model)
+
+# Effect plots of predicted relationships
+epi_effects <- ggpredict(epi_diversity_model, terms = c("Water_Level", "Veg_Cover"))
+plot(epi_effects)
+
+```
+
+```{r lme4 modeling for infauna diversity}
+
+inf_diversity_model <- lme4::lmer(Infauna_Shannon ~ 
+                                   Treatment + 
+                                   Water_Level + 
+                                   Veg_Cover + 
+                                   (1 | Site),
+                                 data = combined_invert_data)
+
+# Model diagnostics using DHARMa
+model_resids <- simulateResiduals(inf_diversity_model, plot = TRUE)
+
+# Additional diagnostic tests
+testDispersion(model_resids)
+testZeroInflation(model_resids) #zero-inflated
+testOutliers(model_resids)
+
+# Moving on to bootstrapping.
+
+confint(inf_diversity_model)
+
+# Bootstrapped confidence intervals
+set.seed(123) # for reproducibility 
+boot_ci <- confint(inf_diversity_model, method="boot", nsim=1000)
+print(boot_ci)
+# Note: Singular fit warnings in some bootstrap samples, but similar confidence intervals to standard method 
+# Suggests stable parameter estimates
+
+# Variance components interpretation: see above
+
+# Compare standard vs bootstrapped intervals
+ci_comparison <- data.frame(
+  Parameter = rownames(boot_ci),
+  Standard_Lower = confint(inf_diversity_model)[,1],
+  Standard_Upper = confint(inf_diversity_model)[,2],
+  Boot_Lower = boot_ci[,1],
+  Boot_Upper = boot_ci[,2]
+)
+print(ci_comparison) # good
+
+# Model summary
+summary(inf_diversity_model)
+
+# Get p-values for fixed effects
+summary(as_lmerModLmerTest(inf_diversity_model))  # converts to lmerTest object
+
+# R-squared
+r.squaredGLMM(inf_diversity_model)
+
+# Effect plots of predicted relationships
+inf_effects <- ggpredict(inf_diversity_model, terms = c("Water_Level", "Veg_Cover"))
+plot(inf_effects)
+
+```
+
+
+
+# Fish
+
+## Q1: Are there differences in fish abundance/size between runnel and non-runnel sites?
+```{r runnel vs non-runnel fish abundance - platform only}
+
+# Comparing runnel vs non-runnel sites using traps on the marsh platform only
+
+# Mixed effects model for fish abundance
+runnel_vs_control_abundance <- glmmTMB(Total_Number_Fish_by_Trap ~ 
+                                         Treatment + 
+                                         Tide +
+                                         (1 | Site),
+                                       data = fish_field_data_no_traps_in_runnels,
+                                       family = nbinom2(link = "log"))
+
+# Model diagnostics
+model_resids <- simulateResiduals(runnel_vs_control_abundance, plot = TRUE)
+# Additional diagnostic tests
+testDispersion(model_resids) #non-significant p-value is good
+testZeroInflation(model_resids) #non-significant p-value is good
+testOutliers(model_resids) #outlier test is non-significant, 
+
+# Model summary
+summary(runnel_vs_control_abundance)
+confint(runnel_vs_control_abundance)
+r.squaredGLMM(runnel_vs_control_abundance)
+
+# Create a prediction grid for abundance
+abundance_preds <- ggpredict(runnel_vs_control_abundance, terms = c("Treatment", "Tide"))
+abundance_preds <- as.data.frame(abundance_preds)
+abundance_preds$Treatment <- factor(abundance_preds$x, levels = levels(fish_field_data_no_traps_in_runnels$Treatment))
+abundance_preds$Tide <- factor(abundance_preds$group, levels = levels(fish_field_data_no_traps_in_runnels$Tide))
+
+
+```
+
+```{r runnel vs non-runnel fish weight - platform only}
+
+# Comparing runnel vs non-runnel sites using traps on the marsh platform only
+
+# Linear model for fish weight (no random effect due to super low variance)
+runnel_vs_control_weight <- lm(log(Fish_Weight) ~ 
+                                        Treatment + 
+                                         Tide,
+                                       data = fish_field_size_data_no_traps_in_runnels)
+
+# Model diagnostics for linear model
+par(mfrow = c(2, 2))
+plot(runnel_vs_control_weight)
+par(mfrow = c(1, 1))
+
+# Model summary
+summary(runnel_vs_control_weight)
+r.squaredGLMM(runnel_vs_control_weight)
+
+# Create prediction grid
+pred_grid <- expand.grid(
+  Treatment = c("Control", "Runnel"),
+  Tide = c("H", "L")
+)
+
+# Get predictions on transformed scale
+pred <- predict(runnel_vs_control_weight, newdata = pred_grid, re.form = ~0, 
+                                      se.fit = TRUE)
+
+# Store predictions and SE on transformed scale
+pred_grid$pred_transformed <- pred$fit
+pred_grid$se_transformed   <- pred$se.fit
+
+# Back-transform to original scale
+pred_grid$pred_weight <- exp(pred_grid$pred_transformed)
+
+# Back-transform SE using delta method
+pred_grid$se_weight <- pred_grid$se_transformed * exp(pred_grid$pred_transformed)
+
+# Calculate means by treatment group
+weight_effects_summary <- pred_grid %>%
+  group_by(Treatment, Tide) %>%
+  summarise(
+    mean_weight = mean(pred_weight, na.rm = TRUE),
+    se_weight   = mean(se_weight, na.rm = TRUE),  
+    .groups = 'drop'
+  )
+
+```
+
+```{r runnel vs non-runnel fish length - platform only}
+
+# Linear model for fish length for platform traps only (no random effect due to super low variance)
+runnel_vs_control_length <- lm(log(Fish_Length) ~ 
+                                        Treatment + 
+                                         Tide,
+                                       data = fish_field_size_data_no_traps_in_runnels)
+
+# Model diagnostics for linear model
+par(mfrow = c(2, 2))
+plot(runnel_vs_control_length)
+par(mfrow = c(1, 1))
+
+# Model summary
+summary(runnel_vs_control_length)
+r.squaredGLMM(runnel_vs_control_length)
+
+
+# Get model predictions for length on the prediction grid
+pred <- predict(runnel_vs_control_length, newdata = pred_grid, re.form = ~0, se.fit = TRUE)
+
+pred_grid$pred_length <- pred$fit
+pred_grid$se_length   <- pred$se.fit   
+
+# Summarize for plotting
+length_effects_summary <- pred_grid %>%
+  group_by(Treatment, Tide) %>%
+  summarise(
+    mean_length = mean(pred_length, na.rm = TRUE),
+    se_length   = mean(se_length, na.rm = TRUE),  
+    .groups = 'drop'
+  )
+
+length_effects_summary$Treatment <- factor(length_effects_summary$Treatment, levels = c("Control", "Runnel"))
+length_effects_summary$Tide <- factor(length_effects_summary$Tide, levels = c("H", "L"))
+
+```
+
+## Q2: Do fish use runnels? (within runnel-sites only)
+```{r within-runnel sites, abundance comparison}
+
+# Comparing fish caught inside runnels vs. on platforms, at runnel sites only
+
+# Filter for runnel sites only
+runnel_sites_data <- fish_field_data %>% filter(Treatment == "Runnel")
+
+# Summary of trap locations and types for runnel sites
+table(runnel_sites_data$Trap_Location, runnel_sites_data$Trap_Type)
+
+# Mixed effects model for fish abundance within runnel sites
+within_runnel_abundance <- glmmTMB(Total_Number_Fish_by_Trap ~ 
+                                     Trap_Location * Tide +  
+                                     (1 | Site),
+                                   data = runnel_sites_data,
+                                   family = nbinom2(link = "log"))
+
+# Model diagnostics
+model_resids <- simulateResiduals(within_runnel_abundance, plot = TRUE)
+# Additional diagnostic tests
+testDispersion(model_resids) #non-significant p-value is good
+testZeroInflation(model_resids) #non-significant p-value is good
+testOutliers(model_resids) #outlier test is non-significant
+
+# Model summary
+summary(within_runnel_abundance)
+confint(within_runnel_abundance)
+r.squaredGLMM(within_runnel_abundance)
+
+# Create a prediction grid for abundance
+abundance_preds <- ggpredict(within_runnel_abundance, terms = c("Trap_Location", "Tide"))
+abundance_preds <- as.data.frame(abundance_preds)
+abundance_preds$Trap_Location <- factor(abundance_preds$x, levels = levels(runnel_sites_data$Trap_Location))
+abundance_preds$Tide <- factor(abundance_preds$group)
+
+##Interpretation: Fish are using the runnels overall, we see more fish in the runnels. Interaction effect is not significant, meaning fish are using the runnels to get on and off the platform. Slightly higher site variation here, but that might be expected because we have fewer sites in this analysis.
+
+```
+
+```{r within-runnel sites, fish weight analysis}
+
+# Comparing fish caught inside runnels vs. on platforms, at runnel sites only
+
+# Filter for runnel sites only
+runnel_fish_data <- fish_field_size_data %>% filter(Treatment == "Runnel")
+
+# Linear model for fish weight (no random effect due to super low variance)
+within_runnel_weight <- lm(I(Fish_Weight^(1/3)) ~ 
+                             Trap_Location + 
+                             Tide,
+                           data = runnel_fish_data)
+
+# Model diagnostics for linear model
+par(mfrow = c(2, 2))
+plot(within_runnel_weight)
+par(mfrow = c(1, 1))
+
+# Model summary
+summary(within_runnel_weight)
+cat("\nR-squared:", round(summary(within_runnel_weight)$r.squared, 3), "\n")
+
+# Create a prediction grid for weight
+runnel_fish_data$Tide <- as.factor(runnel_fish_data$Tide)
+print(levels(runnel_fish_data$Trap_Location))
+print(levels(runnel_fish_data$Tide))
+
+# Creating the prediction grid
+within_pred_grid <- expand.grid(
+  Trap_Location = levels(runnel_fish_data$Trap_Location),
+  Tide = levels(runnel_fish_data$Tide)
+)
+
+# Get predictions on transformed scale, including SE
+pred <- predict(within_runnel_weight, newdata = within_pred_grid, se.fit = TRUE, re.form = ~0)
+
+# Store predictions and model-based SE
+within_pred_grid$pred_transformed <- pred$fit
+within_pred_grid$se_transformed   <- pred$se.fit
+
+# Back-transform predictions to original scale
+within_pred_grid$pred_weight <- within_pred_grid$pred_transformed^3
+
+# Back-transform SE using delta method
+within_pred_grid$se_weight <- within_pred_grid$se_transformed * (3 * within_pred_grid$pred_transformed^2)
+
+# Summarize by group
+within_weight_effects_summary <- within_pred_grid %>%
+  group_by(Trap_Location, Tide) %>%
+  summarise(
+    mean_weight = mean(pred_weight, na.rm = TRUE),
+    se_weight   = mean(se_weight, na.rm = TRUE),  
+    .groups = 'drop'
+  )
+
+
+```
+
+```{r within-runnel sites, fish length analysis}
+
+# Comparing fish caught inside runnels vs. on platforms, at runnel sites only
+
+# Linear model for fish length (no random effect of site due to super low variance)
+within_runnel_length <- lm(Fish_Length ~ 
+                             Trap_Location + 
+                             Tide,
+                           data = runnel_fish_data)
+
+
+# Model diagnostics for linear model
+par(mfrow = c(2, 2))
+plot(within_runnel_length)
+par(mfrow = c(1, 1))
+
+# Model summary
+summary(within_runnel_length)
+cat("\nR-squared:", round(summary(within_runnel_length)$r.squared, 3), "\n")
+
+
+# Create prediction grid for length
+within_length_pred_grid <- expand.grid(
+  Trap_Location = levels(runnel_fish_data$Trap_Location),
+  Tide = levels(runnel_fish_data$Tide)
+)
+
+# Get predictions and model-based SE
+pred <- predict(within_runnel_length, newdata = within_length_pred_grid, 
+                se.fit = TRUE, re.form = ~0)
+
+# Store predictions and SE
+within_length_pred_grid$pred_length <- pred$fit
+within_length_pred_grid$se_length   <- pred$se.fit
+
+# Summarize by group for plotting
+within_length_effects_summary <- within_length_pred_grid %>%
+  group_by(Trap_Location, Tide) %>%
+  summarise(
+    mean_length = mean(pred_length, na.rm = TRUE),
+    se_length   = mean(se_length, na.rm = TRUE),  # use model-based SE
+    .groups = 'drop'
+  )
+
+```
+
+## Q3: Are fish coming onto the platform with empty stomachs?
+```{r incoming vs receding tide stomach comparison}
+
+# Comparing incoming (L) vs receding (H) tide fish to confirm "empty stomach"
+
+# Filter for trap location to excludes traps in the runnels 
+tide_comparison_data <- combined_fish_data %>%
+  filter(Trap_Location != "Runnel")
+
+# --- Model for Percent Digested ---
+
+# Response 'Digested' is a percentage --> Beta regression
+# We have such low variance in the random effect that is causes singularity issues. We're going to drop the random effects here and use `betareg`
+
+# Convert 'Digested' to a proportion and transform to handle 0s and 1s
+n <- nrow(tide_comparison_data)
+tide_comparison_data <- tide_comparison_data %>%
+  mutate(Digested_prop = Digested / 100,
+         Digested_prop_transformed = (Digested_prop * (n - 1) + 0.5) / n)
+
+# beta regression model
+digested_model_beta <- betareg(Digested_prop_transformed ~ Tide, data = tide_comparison_data)
+
+# Model diagnostics for beta regression; can't use DHARMa here
+# 1. Standard residual plots
+par(mfrow = c(2, 2))
+plot(digested_model_beta, which = 1:4)
+
+# Pearson residuals vs fitted values
+fitted_vals <- fitted(digested_model_beta)
+pearson_resid <- residuals(digested_model_beta, type = "pearson")
+
+plot(fitted_vals, pearson_resid,
+     xlab = "Fitted values",
+     ylab = "Pearson residuals",
+     main = "Pearson Residuals vs Fitted Values")
+abline(h = 0, lty = 2)
+
+
+par(mfrow = c(1, 1)) # reset plot layout
+
+# Pseudo R-squared
+pseudo_r2 <- 1 - (digested_model_beta$loglik / digested_model_beta$null.loglik)
+cat("Pseudo R-squared:", round(pseudo_r2, 3), "\n") # low here but not surprising
+
+# Comparison with null model
+null_model <- betareg(Digested_prop_transformed ~ 1, data = tide_comparison_data)
+
+# Likelihood ratio test
+lr_stat <- 2 * (digested_model_beta$loglik - null_model$loglik)
+df_diff <- length(coef(digested_model_beta)) - length(coef(null_model))
+p_value <- 1 - pchisq(lr_stat, df_diff)
+
+cat("Test statistic:", round(lr_stat, 3), "\n")
+cat("Degrees of freedom:", df_diff, "\n")
+cat("P-value:", round(p_value, 4), "\n")
+
+# Model summary and confidence intervals
+summary(digested_model_beta)
+confint(digested_model_beta)
+
+##Interpretation: The % digested as a beta regression showed (a) very little difference between sites and (b) a strong effect of tides. The "empty stomach" can be confirmed here; fish caught on the incoming tide (L) have a significantly higher proportion of digested material (coefficient of 1.1508) compared to fish caught on the receding tide 
+
+```
+
+## Q4: What do fish consume on the platform; is it different between runnelled and un-runnelled sites?
+
+```{r receding tide NMDS analysis; full data}
+
+# NMDS analysis of fish diet composition on receding tide
+
+# Filter for receding tide data only
+fish_diet_receding <- combined_fish_data %>% 
+  filter(Tide == "H")
+
+# Remove rows with 100% digested content (no diet data)
+fish_diet_receding_no_100 <- fish_diet_receding %>%
+  filter(Digested != "100")
+
+# Remove any columns with all zeroes
+fish_diet_receding_no_100 <- fish_diet_receding_no_100[, colSums(fish_diet_receding_no_100 != 0) > 0]
+
+# Separate environmental data and species data
+fish_diet_spp <- fish_diet_receding_no_100 %>% select(c(Algae:Beetles, Diptera:Total_Crab))
+
+# Check for zero-variance columns and remove them
+zero_var_cols <- sapply(fish_diet_spp, function(x) var(x, na.rm = TRUE) == 0)
+if(any(zero_var_cols)) {
+  cat("Removing zero-variance columns:\n")
+  print(names(fish_diet_spp)[zero_var_cols])
+  fish_diet_spp <- fish_diet_spp[, !zero_var_cols]
+}
+
+# Also check for very low variance columns
+low_var_cols <- sapply(fish_diet_spp, function(x) {
+  var_val <- var(x, na.rm = TRUE)
+  return(var_val < 0.001)  # Very low variance threshold
+})
+if(any(low_var_cols)) {
+  cat("Low-variance columns found:\n")
+  print(names(fish_diet_spp)[low_var_cols])
+}
+
+# Environmental dataframe
+fish_diet_env <- fish_diet_receding_no_100 %>% 
+  select(c(Site:Tide, Fish_ID, Trap_Type:Treatment)) %>% 
+  mutate(Site_ID_Tide_Version = paste(Site, ID, Tide, Fish_ID, sep = "")) %>% 
+  select(-Site, -ID, -Tide, -Fish_ID) 
+
+# Diagnostic information before NMDS (initial analysis)
+cat("Data structure before outlier removal:\n")
+cat("Number of samples:", nrow(fish_diet_spp), "\n")
+cat("Number of species:", ncol(fish_diet_spp), "\n")
+cat("Total abundance:", sum(fish_diet_spp, na.rm = TRUE), "\n")
+cat("Number of zero entries:", sum(fish_diet_spp == 0, na.rm = TRUE), "\n")
+cat("Proportion of zeros:", round(sum(fish_diet_spp == 0, na.rm = TRUE) / length(as.matrix(fish_diet_spp)), 3), "\n")
+
+if(nrow(fish_diet_spp) < 3) {
+  cat("WARNING: Too few samples for NMDS analysis\n")
+} else if(ncol(fish_diet_spp) < 2) {
+  cat("WARNING: Too few species for NMDS analysis\n")
+} else {
+  # Performing nmds with environmental (treatment) and species vectors
+  fish_diet_mds <- metaMDS(fish_diet_spp, distance = "bray", autotransform = FALSE)
+  
+  # Check stress value
+  cat("NMDS stress value:", round(fish_diet_mds$stress, 4), "\n")
+}
+
+# Only run envfit if NMDS was successful and we have species data
+if(!inherits(fish_diet_mds, "try-error") && ncol(fish_diet_spp) > 0) {
+  fish_diet_sppfit <- envfit(fish_diet_mds, fish_diet_spp, permutations = 999) # Fit species vectors
+} else {
+  cat("NMDS failed or no species data available. Check your data.\n")
+}
+
+fish_diet_mds  # Check stress value
+
+# Saving initial NMDS results
+fish_diet_site_scrs <- as.data.frame(scores(fish_diet_mds, display = "sites"))
+fish_diet_site_scrs <- cbind(fish_diet_site_scrs, Treatment = fish_diet_env$Treatment)
+
+## Checking for outliers
+
+# Outliers identified as samples with NMDS1 scores above the 99th percentile in the initial NMDS ordination of fish diet composition.
+outlier_indices <- which(fish_diet_site_scrs$NMDS1 > quantile(fish_diet_site_scrs$NMDS1, 0.99))
+outlier_samples <- rownames(fish_diet_site_scrs)[outlier_indices]
+print(outlier_samples)  # "LBSL3H36" "LBSL3H23"
+
+# Remove rows with outliers
+fish_diet_receding_no_100_no_outliers <- fish_diet_receding_no_100 %>%
+  .[!(rownames(.) %in% outlier_samples), ]
+
+fish_diet_receding_no_100_no_outliers <- fish_diet_receding_no_100_no_outliers[, colSums(fish_diet_receding_no_100 != 0) > 0]
+
+## Re-running NMDS with outliers removed
+
+# Separate environmental data and species data
+fish_diet_spp <- fish_diet_receding_no_100_no_outliers %>% select(c(Algae:Beetles,Diptera:Total_Crab))
+
+# Check for zero-variance columns and remove them (after outlier removal)
+zero_var_cols_no_outliers <- sapply(fish_diet_spp, function(x) var(x, na.rm = TRUE) == 0)
+if(any(zero_var_cols_no_outliers)) {
+  cat("Removing zero-variance columns (after outlier removal):\n")
+  print(names(fish_diet_spp)[zero_var_cols_no_outliers])
+  fish_diet_spp <- fish_diet_spp[, !zero_var_cols_no_outliers]
+}
+
+# Also check for very low variance columns
+low_var_cols_no_outliers <- sapply(fish_diet_spp, function(x) {
+  var_val <- var(x, na.rm = TRUE)
+  return(var_val < 0.001)  # Very low variance threshold
+})
+if(any(low_var_cols_no_outliers)) {
+  cat("Low-variance columns found (after outlier removal):\n")
+  print(names(fish_diet_spp)[low_var_cols_no_outliers])
+}
+
+# Environmental dataframe
+fish_diet_env <- fish_diet_receding_no_100_no_outliers %>% 
+  select(c(Site:Tide, Fish_ID, Trap_Type:Treatment)) %>% 
+  mutate(Site_ID_Tide_Version = paste(Site, ID, Tide, Fish_ID, sep = "")) %>% 
+  select(-Site, -ID, -Tide, -Fish_ID) 
+
+# Diagnostic information before NMDS (after outlier removal)
+cat("Data structure after outlier removal:\n")
+cat("Number of samples:", nrow(fish_diet_spp), "\n")
+cat("Number of species:", ncol(fish_diet_spp), "\n")
+cat("Total abundance:", sum(fish_diet_spp, na.rm = TRUE), "\n")
+cat("Number of zero entries:", sum(fish_diet_spp == 0, na.rm = TRUE), "\n")
+cat("Proportion of zeros:", round(sum(fish_diet_spp == 0, na.rm = TRUE) / length(as.matrix(fish_diet_spp)), 3), "\n")
+
+# Check if we have enough data for meaningful NMDS
+if(nrow(fish_diet_spp) < 3) {
+  cat("WARNING: Too few samples for NMDS analysis\n")
+} else if(ncol(fish_diet_spp) < 2) {
+  cat("WARNING: Too few species for NMDS analysis\n")
+} else {
+  # Performing nmds with environmental (treatment) and species vectors
+  fish_diet_mds <- metaMDS(fish_diet_spp, distance = "bray", autotransform = FALSE)
+  
+  # Check stress value
+  cat("NMDS stress value:", round(fish_diet_mds$stress, 4), "\n")
+}
+
+# Only run envfit if NMDS was successful and we have species data
+if(!inherits(fish_diet_mds, "try-error") && ncol(fish_diet_spp) > 0) {
+  fish_diet_sppfit <- envfit(fish_diet_mds, fish_diet_spp, permutations = 999) # Fit species vectors
+} else {
+  cat("NMDS failed or no species data available. Check your data.\n")
+}
+
+fish_diet_mds  # Check stress value
+
+# Saving initial NMDS results
+fish_diet_site_scrs <- as.data.frame(scores(fish_diet_mds, display = "sites"))
+fish_diet_site_scrs <- cbind(fish_diet_site_scrs, Treatment = fish_diet_env$Treatment)
+
+# Species contributions
+fish_diet_spp_scrs <- as.data.frame(scores(fish_diet_sppfit, display = "vectors"))
+fish_diet_spp_scrs <- cbind(fish_diet_spp_scrs, Species = rownames(fish_diet_spp_scrs))
+fish_diet_spp_scrs <- cbind(fish_diet_spp_scrs, pval = fish_diet_sppfit$vectors$pvals)
+sig_fish_diet_spp_scrs <- subset(fish_diet_spp_scrs, pval<=0.05)
+
+# PERMANOVA (adonis2) for overall fish diet composition difference,
+permanova_result_fish_diet_trap_type <- adonis2(fish_diet_spp ~ Treatment, data = fish_diet_env, permutations = 999, strata = fish_diet_env$Trap_Type)
+print(permanova_result_fish_diet_trap_type)
+
+# Additional analysis to understand Trap_Type effect
+# First, let's see the distribution of Trap_Type in our data
+cat("\nTrap Type distribution in fish diet analysis:\n")
+print(table(fish_diet_env$Trap_Type))
+
+cat("\nTrap Type by Treatment:\n")
+print(table(fish_diet_env$Trap_Type, fish_diet_env$Treatment))
+
+# Run PERMANOVA without strata to compare
+permanova_result_fish_diet_no_strata <- adonis2(fish_diet_spp ~ Treatment, data = fish_diet_env, permutations = 999)
+cat("\nPERMANOVA without strata (for comparison):\n")
+print(permanova_result_fish_diet_no_strata)
+
+# Calculate effect size (R²) for both models
+r2_with_strata <- permanova_result_fish_diet_trap_type$R2[1]
+r2_without_strata <- permanova_result_fish_diet_no_strata$R2[1]
+
+cat("\nEffect size comparison:\n")
+cat("R² with Trap_Type strata:", round(r2_with_strata, 4), "\n")
+cat("R² without strata:", round(r2_without_strata, 4), "\n")
+cat("Difference in R²:", round(r2_without_strata - r2_with_strata, 4), "\n")
+
+# Test if Trap_Type itself has a significant effect on diet composition
+permanova_trap_type_effect <- adonis2(fish_diet_spp ~ Trap_Type, data = fish_diet_env, permutations = 999)
+cat("\nPERMANOVA testing Trap_Type effect on diet composition:\n")
+print(permanova_trap_type_effect)
+
+# Calculate average dissimilarity within and between Trap_Type groups
+trap_type_groups <- fish_diet_env$Trap_Type
+trap_type_dissimilarity <- vegdist(fish_diet_spp, method = "bray")
+
+# Calculate average dissimilarity within each Trap_Type
+within_dissimilarity <- sapply(unique(trap_type_groups), function(trap_type) {
+  group_indices <- which(trap_type_groups == trap_type)
+  if(length(group_indices) > 1) {
+    group_dist <- as.matrix(trap_type_dissimilarity)[group_indices, group_indices]
+    mean(group_dist[upper.tri(group_dist)], na.rm = TRUE)
+  } else {
+    NA
+  }
+})
+
+cat("\nAverage dissimilarity within Trap_Type groups:\n")
+for(i in seq_along(within_dissimilarity)) {
+  if(!is.na(within_dissimilarity[i])) {
+    cat(names(within_dissimilarity)[i], ":", round(within_dissimilarity[i], 4), "\n")
+  }
+}
+
+# Calculate overall average dissimilarity
+overall_dissimilarity <- mean(as.matrix(trap_type_dissimilarity)[upper.tri(trap_type_dissimilarity)], na.rm = TRUE)
+cat("Overall average dissimilarity:", round(overall_dissimilarity, 4), "\n")
+
+# Calculate coefficient of variation for dissimilarity within groups
+cv_within <- sapply(unique(trap_type_groups), function(trap_type) {
+  group_indices <- which(trap_type_groups == trap_type)
+  if(length(group_indices) > 1) {
+    group_dist <- as.matrix(trap_type_dissimilarity)[group_indices, group_indices]
+    group_vals <- group_dist[upper.tri(group_dist)]
+    sd(group_vals, na.rm = TRUE) / mean(group_vals, na.rm = TRUE)
+  } else {
+    NA
+  }
+})
+
+cat("\nCoefficient of variation for dissimilarity within Trap_Type groups:\n")
+for(i in seq_along(cv_within)) {
+  if(!is.na(cv_within[i])) {
+    cat(names(cv_within)[i], ":", round(cv_within[i], 4), "\n")
+  }
+}
+
+# SIMPER analysis for fish diet
+mat_bar_fish_diet_spp <- as.matrix(fish_diet_spp)
+simp_env_fish_diet <- simper(mat_bar_fish_diet_spp, fish_diet_env$Treatment)
+summary(simp_env_fish_diet, ordered = TRUE, digits = 3)
+
+# Additional diagnostic: NMDS plot colored by Trap_Type to visualize the effect
+fish_diet_site_scrs_with_trap_type <- cbind(fish_diet_site_scrs, Trap_Type = fish_diet_env$Trap_Type)
+```
+
+## SQ1: Does trap type affect fish dynamics?
+
+```{r fish abundance between trap types - control sites only}
+
+# Comparing fish caught in Breder versus bottle traps at control sites only, where all traps were placed on the platform
+
+# Filter for control sites only
+control_sites_data <- fish_field_data %>% filter(Treatment == "Control")
+
+# Summary of trap locations and types for runnel sites
+table(control_sites_data$Trap_Type)
+
+# Mixed effects model for fish abundance within control sites
+within_control_abundance <- glmmTMB(Total_Number_Fish_by_Trap ~ 
+                                     Trap_Type +
+                                     (1 | Site),
+                                   data = control_sites_data,
+                                   family = nbinom2(link = "log"))
+
+# Model diagnostics
+model_resids <- simulateResiduals(within_control_abundance, plot = TRUE)
+# Additional diagnostic tests
+testDispersion(model_resids) #non-significant p-value is good
+testZeroInflation(model_resids) #non-significant p-value is good
+testOutliers(model_resids) #outlier test is non-significant, indicating no significant outliers 
+
+# Model summary
+summary(within_control_abundance)
+confint(within_control_abundance)
+r.squaredGLMM(within_control_abundance)
+
+# Create a prediction grid for abundance with Trap_Type only
+abundance_preds <- ggpredict(within_control_abundance, terms = c("Trap_Type"))
+abundance_preds <- as.data.frame(abundance_preds)
+abundance_preds$Trap_Type <- factor(abundance_preds$x, levels = levels(control_sites_data$Trap_Type))
+
+```
+
+```{r fish weight between trap types - control sites only}
+
+# Comparing fish caught in Breder versus bottle traps
+
+control_fish_data <- fish_field_size_data %>% filter(Treatment == "Control")
+
+# Model with no random effect due to super low variance
+within_control_weight <- lm(log(Fish_Weight) ~ 
+                                         Trap_Type,
+                                       data = control_fish_data)
+
+# Model diagnostics for linear model
+par(mfrow = c(2, 2))
+plot(within_control_weight)
+par(mfrow = c(1, 1))
+
+# Model summary
+summary(within_control_weight)
+r.squaredGLMM(within_control_weight)
+
+# Create prediction grid
+pred_grid <- expand.grid(
+  Trap_Type = c("Breder", "Bottle")
+)
+
+# Get predictions on transformed scale, including model-based SE
+pred <- predict(within_control_weight, newdata = pred_grid, re.form = ~0, se.fit = TRUE)
+
+# Store predictions and SE
+pred_grid$pred_transformed <- pred$fit
+pred_grid$se_transformed   <- pred$se.fit
+
+# Back-transform to original scale (log -> original)
+pred_grid$pred_weight <- exp(pred_grid$pred_transformed)
+
+# Back-transform SE using delta method
+pred_grid$se_weight <- pred_grid$se_transformed * exp(pred_grid$pred_transformed)
+
+# Summarize by Trap_Type for plotting
+weight_effects_summary <- pred_grid %>%
+  group_by(Trap_Type) %>%
+  summarise(
+    mean_weight = mean(pred_weight, na.rm = TRUE),
+    se_weight   = mean(se_weight, na.rm = TRUE),  # use model-based SE
+    .groups = 'drop'
+  )
+
+##Interpretation: trap type is not significant for weight.
+
+```
+
+```{r fish length between trap types - control sites only}
+
+# Comparing fish caught in Breder versus bottle traps
+
+# Model with no random effect due to super low variance
+within_control_length <- lm(log(Fish_Length) ~ 
+                             Trap_Type,
+                           data = control_fish_data)
+
+
+# Model diagnostics for linear model
+par(mfrow = c(2, 2))
+plot(within_control_length)
+par(mfrow = c(1, 1))
+
+# Model summary
+summary(within_control_length)
+r.squaredGLMM(within_control_length)
+
+# Create prediction grid
+pred_grid <- expand.grid(
+  Trap_Type = levels(control_fish_data$Trap_Type)
+)
+
+# Get predictions and model-based SE
+pred <- predict(within_control_length, newdata = pred_grid, re.form = ~0, se.fit = TRUE)
+
+# Store predictions and SE
+pred_grid$pred_length <- pred$fit
+pred_grid$se_length   <- pred$se.fit
+
+# Summarize by Trap_Type for plotting
+length_effects_summary <- pred_grid %>%
+  group_by(Trap_Type) %>%
+  summarise(
+    mean_length = mean(pred_length, na.rm = TRUE),
+    se_length   = mean(se_length, na.rm = TRUE),  # use model-based SE
+    .groups = 'drop'
+  )
+
+```
+
