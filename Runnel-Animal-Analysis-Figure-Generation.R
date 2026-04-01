@@ -1,8 +1,6 @@
-# Community effects of runnels - Figure Generation
+# Animal response to runnels - Figure Generation
 # Code by Amanda Wik and Nathalie Sommer
 # 
-# NOTE: Run the R Markdown file first to generate all analyses and objects
-# This script only generates the publication figures
 
 # Libraries
 library(vegan)
@@ -63,10 +61,8 @@ combined_invert_data$Infauna_Shannon <- diversity(select(combined_invert_data, C
 
 # Load fish data
 
-
 fish_diet_data <- read.csv('Fish_Gut_Data_2025.csv', 
                            header=TRUE, stringsAsFactors=FALSE)
-
 
 fish_survey_data <- read.csv('Fish_Survey_Data_2024.csv', 
                              header=TRUE, stringsAsFactors=FALSE)
@@ -106,12 +102,12 @@ fish_survey_data <- fish_survey_data %>%
             by = c("Site", "ID", "Tide")) %>%
   mutate(Total_Number_Fish_by_Trap = replace_na(Total_Number_Fish_by_Trap, 0))
 
-#Adding site data to fish field size dataframe
+#Adding site data to fish size dataframe
 fish_field_size_data <- fish_size_data %>%
   left_join(fish_survey_data %>% select(Site:Treatment),
             by = c("Site", "ID", "Tide")) 
 
-# Data preparation - excluding platform traps
+# Data preparation - excluding traps in the runnels
 combined_fish_data_no_traps_in_runnels <- combined_fish_data %>% filter(Trap_Location != "Runnel")
 fish_survey_data_no_traps_in_runnels <- fish_survey_data %>% filter(Trap_Location != "Runnel")
 fish_field_size_data_no_traps_in_runnels <- fish_field_size_data %>% filter(Trap_Location != "Runnel")
@@ -132,7 +128,7 @@ combined_fish_data$Diet_Diversity_Shannon <- combined_fish_data %>%
 
 # Add row names
 combined_fish_data <- combined_fish_data %>%
-  mutate(Site_ID_Tide_Version = paste(Site, ID,Tide,Fish_ID, sep = ""))
+  mutate(Site_ID_Tide_Version = paste(Site, ID, Tide, Fish_ID, sep = ""))
 
 combined_fish_data <- combined_fish_data %>% column_to_rownames("Site_ID_Tide_Version")
 
@@ -143,11 +139,12 @@ runnel_fish_data_size <- fish_field_size_data %>% filter(Treatment == "Runnel")
 
 cat("Fish data processed successfully!\n")
 
+
 # Generate figures
 
 # Color palettes
 pal_nature <- c("Control" = "#6C568CFF", "Runnel" = "#607345FF")
-pal_tide <- c("H" = "#9386A6FF", "L" = "#583885")  # High tide light, low tide dark
+pal_tide <- c("H" = "#9386A6FF", "L" = "#583885")  
 pal_location <- c("Platform" = "#6C568CFF", "Runnel" = "#607345FF")
 
 pub_theme <- theme_bw(base_size = 10) +
@@ -164,10 +161,10 @@ pub_theme <- theme_bw(base_size = 10) +
 
 # Define group color palette for fish plots
 pal_fish <- c(
-  "Control_L" = "#583885",   # dark purple
-  "Control_H" = "#9386A6FF",   # light purple
-  "Runnel_L"  = "#507520",   # dark green
-  "Runnel_H"  = "#7F8C72FF"    # light green
+  "Control_L" = "#583885",   
+  "Control_H" = "#9386A6FF",   
+  "Runnel_L"  = "#507520",   
+  "Runnel_H"  = "#7F8C72FF"    
 )
 
 # Define the palette for within-runnel plots
@@ -428,37 +425,132 @@ within_runnel_combined <- within_runnel_abundance_plot / within_runnel_weight_pl
 
 
 # Figure 7: Fish diet NMDS
-
-# Filter for receding tide only
+# Filter for receding tide data only
 fish_diet_receding <- combined_fish_data %>% 
-  filter(Tide == "H") %>%
-  filter(Trap_Location != "Runnel")
+  filter(Tide == "H")
 
-# Remove 100% digested rows
+# Remove rows with 100% digested content (no diet data)
 fish_diet_receding_no_100 <- fish_diet_receding %>%
   filter(Digested != "100")
 
-# Seperate env and species data
-fish_diet_spp <- fish_diet_receding_no_100 %>% select(c(Algae:Beetles,Diptera:Total_Crab))
+# Remove any columns with all zeroes
+fish_diet_receding_no_100 <- fish_diet_receding_no_100[, colSums(fish_diet_receding_no_100 != 0) > 0]
 
-# Remove zero-variance columns
+# Separate environmental data and species data
+fish_diet_spp <- fish_diet_receding_no_100 %>% select(c(Algae:Beetles, Diptera:Total_Crab))
+
+# Check for zero-variance columns and remove them
 zero_var_cols <- sapply(fish_diet_spp, function(x) var(x, na.rm = TRUE) == 0)
 if(any(zero_var_cols)) {
+  cat("Removing zero-variance columns:\n")
+  print(names(fish_diet_spp)[zero_var_cols])
   fish_diet_spp <- fish_diet_spp[, !zero_var_cols]
 }
 
-# Env dataframe
-fish_diet_treatment <- fish_diet_receding_no_100 %>% 
-  select(c(Site:Tide, Fish_ID, Treatment)) %>% 
-  mutate(Site_ID_Tide_Fish = paste(Site, ID, Tide, Fish_ID, sep = "")) %>% 
+# Also check for very low variance columns
+low_var_cols <- sapply(fish_diet_spp, function(x) {
+  var_val <- var(x, na.rm = TRUE)
+  return(var_val < 0.001)  # Very low variance threshold
+})
+if(any(low_var_cols)) {
+  cat("Low-variance columns found:\n")
+  print(names(fish_diet_spp)[low_var_cols])
+}
+
+# Environmental dataframe
+fish_diet_env <- fish_diet_receding_no_100 %>% 
+  select(c(Site:Tide, Fish_ID, Trap_Type:Treatment)) %>% 
+  mutate(Site_ID_Tide_Version = paste(Site, ID, Tide, Fish_ID, sep = "")) %>% 
   select(-Site, -ID, -Tide, -Fish_ID) 
 
-# Perform NMDS
-fish_diet_mds <- metaMDS(fish_diet_spp, distance = "bray", autotransform = FALSE)
+if(nrow(fish_diet_spp) < 3) {
+  cat("WARNING: Too few samples for NMDS analysis\n")
+} else if(ncol(fish_diet_spp) < 2) {
+  cat("WARNING: Too few species for NMDS analysis\n")
+} else {
+  # Performing nmds with environmental (treatment) and species vectors
+  fish_diet_mds <- metaMDS(fish_diet_spp, distance = "bray", autotransform = FALSE)
+  
+  # Check stress value
+  cat("NMDS stress value:", round(fish_diet_mds$stress, 4), "\n")
+}
 
-# Create site scores
+# Only run envfit if NMDS was successful and we have species data
+if(!inherits(fish_diet_mds, "try-error") && ncol(fish_diet_spp) > 0) {
+  fish_diet_sppfit <- envfit(fish_diet_mds, fish_diet_spp, permutations = 999) # Fit species vectors
+} else {
+  cat("NMDS failed or no species data available. Check your data.\n")
+}
+
+# Saving initial NMDS results
 fish_diet_site_scrs <- as.data.frame(scores(fish_diet_mds, display = "sites"))
-fish_diet_site_scrs <- cbind(fish_diet_site_scrs, Treatment = fish_diet_treatment$Treatment)
+fish_diet_site_scrs <- cbind(fish_diet_site_scrs, Treatment = fish_diet_env$Treatment)
+
+# Removing outliers
+
+# Outliers identified as samples with NMDS1 scores above the 99th percentile in the initial NMDS ordination of fish diet composition.
+outlier_indices <- which(fish_diet_site_scrs$NMDS1 > quantile(fish_diet_site_scrs$NMDS1, 0.99))
+outlier_samples <- rownames(fish_diet_site_scrs)[outlier_indices]
+print(outlier_samples)  
+
+# Remove rows with outliers
+fish_diet_receding_no_100_no_outliers <- fish_diet_receding_no_100 %>%
+  .[!(rownames(.) %in% outlier_samples), ]
+
+fish_diet_receding_no_100_no_outliers <- fish_diet_receding_no_100_no_outliers[, colSums(fish_diet_receding_no_100 != 0) > 0]
+
+# Re-running NMDS with outliers removed
+
+# Separate environmental data and species data
+fish_diet_spp <- fish_diet_receding_no_100_no_outliers %>% select(c(Algae:Beetles,Diptera:Total_Crab))
+
+# Check for zero-variance columns and remove them (after outlier removal)
+zero_var_cols_no_outliers <- sapply(fish_diet_spp, function(x) var(x, na.rm = TRUE) == 0)
+if(any(zero_var_cols_no_outliers)) {
+  cat("Removing zero-variance columns (after outlier removal):\n")
+  print(names(fish_diet_spp)[zero_var_cols_no_outliers])
+  fish_diet_spp <- fish_diet_spp[, !zero_var_cols_no_outliers]
+}
+
+# Also check for very low variance columns
+low_var_cols_no_outliers <- sapply(fish_diet_spp, function(x) {
+  var_val <- var(x, na.rm = TRUE)
+  return(var_val < 0.001)  # Very low variance threshold
+})
+if(any(low_var_cols_no_outliers)) {
+  cat("Low-variance columns found (after outlier removal):\n")
+  print(names(fish_diet_spp)[low_var_cols_no_outliers])
+}
+
+# Environmental dataframe
+fish_diet_env <- fish_diet_receding_no_100_no_outliers %>% 
+  select(c(Site:Tide, Fish_ID, Trap_Type:Treatment)) %>% 
+  mutate(Site_ID_Tide_Version = paste(Site, ID, Tide, Fish_ID, sep = "")) %>% 
+  select(-Site, -ID, -Tide, -Fish_ID) 
+
+# Check if we have enough data for meaningful NMDS
+if(nrow(fish_diet_spp) < 3) {
+  cat("WARNING: Too few samples for NMDS analysis\n")
+} else if(ncol(fish_diet_spp) < 2) {
+  cat("WARNING: Too few species for NMDS analysis\n")
+} else {
+  # Performing nmds with environmental (treatment) and species vectors
+  fish_diet_mds <- metaMDS(fish_diet_spp, distance = "bray", autotransform = FALSE)
+  
+  # Check stress value
+  cat("NMDS stress value:", round(fish_diet_mds$stress, 4), "\n")
+}
+
+# Only run envfit if NMDS was successful and we have species data
+if(!inherits(fish_diet_mds, "try-error") && ncol(fish_diet_spp) > 0) {
+  fish_diet_sppfit <- envfit(fish_diet_mds, fish_diet_spp, permutations = 999) # Fit species vectors
+} else {
+  cat("NMDS failed or no species data available. Check your data.\n")
+}
+
+# Saving new NMDS results
+fish_diet_site_scrs <- as.data.frame(scores(fish_diet_mds, display = "sites"))
+fish_diet_site_scrs <- cbind(fish_diet_site_scrs, Treatment = fish_diet_env$Treatment)
 
 # Create the plot
 fish_diet_nmds_plot <- ggplot(fish_diet_site_scrs, aes(x = NMDS1, y = NMDS2, color = Treatment, shape = Treatment)) +
@@ -492,11 +584,10 @@ trap_type_abundance_plot <- ggplot(control_sites_data, aes(x = Trap_Type, y = To
 ggsave("Supplementary_S1_Trap_Type_Comparison.png", trap_type_abundance_plot, 
 width = 4, height = 3, dpi = 600, device = "png")
 
-# S2: Percent digested contnet
-tide_comparison_data <- combined_fish_data %>%
-  filter(Trap_Location != "Runnel")
+                                    
+# S2: Percent digested content
 
-digested_plot <- ggplot(tide_comparison_data, aes(x = Tide, y = Digested, fill = Tide)) +
+digested_plot <- ggplot(combined_fish_data, aes(x = Tide, y = Digested, fill = Tide)) +
   geom_boxplot(alpha = 0.7, width = 0.6) +
   geom_jitter(width = 0.2, alpha = 0.6, size = 1.5, shape = 21, fill = "white") +
   scale_fill_manual(values = pal_tide) +
