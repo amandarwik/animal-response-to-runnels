@@ -986,7 +986,7 @@ fish_diet_site_scrs <- cbind(fish_diet_site_scrs, Treatment = fish_diet_env$Trea
 # Outliers identified as samples with NMDS1 scores above the 99th percentile in the initial NMDS ordination of fish diet composition.
 outlier_indices <- which(fish_diet_site_scrs$NMDS1 > quantile(fish_diet_site_scrs$NMDS1, 0.99))
 outlier_samples <- rownames(fish_diet_site_scrs)[outlier_indices]
-print(outlier_samples)  # "LBSL3H36" "LBSL3H23"
+print(outlier_samples)
 
 # Remove rows with outliers
 fish_diet_receding_no_100_no_outliers <- fish_diet_receding_no_100 %>%
