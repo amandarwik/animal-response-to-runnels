@@ -624,7 +624,6 @@ par(mfrow = c(1, 1))
 
 # Model summary
 summary(runnel_vs_control_weight)
-r.squaredGLMM(runnel_vs_control_weight)
 
 # Create prediction grid
 pred_grid <- expand.grid(
@@ -672,8 +671,6 @@ par(mfrow = c(1, 1))
 
 # Model summary
 summary(runnel_vs_control_length)
-r.squaredGLMM(runnel_vs_control_length)
-
 
 # Get model predictions for length on the prediction grid
 pred <- predict(runnel_vs_control_length, newdata = pred_grid, re.form = ~0, se.fit = TRUE)
@@ -706,7 +703,7 @@ runnel_sites_data <- fish_field_data %>% filter(Treatment == "Runnel")
 # Summary of trap locations and types for runnel sites
 table(runnel_sites_data$Trap_Location, runnel_sites_data$Trap_Type)
 
-# Mixed effects model for fish abundance within runnel sites
+# Negative binomial generalized linear mixed model for fish abundance within runnel sites
 within_runnel_abundance <- glmmTMB(Total_Number_Fish_by_Trap ~ 
                                      Trap_Location * Tide +  
                                      (1 | Site),
@@ -730,8 +727,6 @@ abundance_preds <- ggpredict(within_runnel_abundance, terms = c("Trap_Location",
 abundance_preds <- as.data.frame(abundance_preds)
 abundance_preds$Trap_Location <- factor(abundance_preds$x, levels = levels(runnel_sites_data$Trap_Location))
 abundance_preds$Tide <- factor(abundance_preds$group)
-
-##Interpretation: Fish are using the runnels overall, we see more fish in the runnels. Interaction effect is not significant, meaning fish are using the runnels to get on and off the platform. Slightly higher site variation here, but that might be expected because we have fewer sites in this analysis.
 
 ```
 
@@ -803,7 +798,6 @@ within_runnel_length <- lm(Fish_Length ~
                              Tide,
                            data = runnel_fish_data)
 
-
 # Model diagnostics for linear model
 par(mfrow = c(2, 2))
 plot(within_runnel_length)
@@ -812,7 +806,6 @@ par(mfrow = c(1, 1))
 # Model summary
 summary(within_runnel_length)
 cat("\nR-squared:", round(summary(within_runnel_length)$r.squared, 3), "\n")
-
 
 # Create prediction grid for length
 within_length_pred_grid <- expand.grid(
@@ -845,8 +838,7 @@ within_length_effects_summary <- within_length_pred_grid %>%
 # Comparing incoming (L) vs receding (H) tide fish to confirm "empty stomach"
 
 # Filter for trap location to excludes traps in the runnels 
-tide_comparison_data <- combined_fish_data %>%
-  filter(Trap_Location != "Runnel")
+tide_comparison_data <- combined_fish_data
 
 # --- Model for Percent Digested ---
 
@@ -877,7 +869,6 @@ plot(fitted_vals, pearson_resid,
      main = "Pearson Residuals vs Fitted Values")
 abline(h = 0, lty = 2)
 
-
 par(mfrow = c(1, 1)) # reset plot layout
 
 # Pseudo R-squared
@@ -899,8 +890,6 @@ cat("P-value:", round(p_value, 4), "\n")
 # Model summary and confidence intervals
 summary(digested_model_beta)
 confint(digested_model_beta)
-
-##Interpretation: The % digested as a beta regression showed (a) very little difference between sites and (b) a strong effect of tides. The "empty stomach" can be confirmed here; fish caught on the incoming tide (L) have a significantly higher proportion of digested material (coefficient of 1.1508) compared to fish caught on the receding tide 
 
 ```
 
@@ -1160,7 +1149,7 @@ control_sites_data <- fish_field_data %>% filter(Treatment == "Control")
 # Summary of trap locations and types for runnel sites
 table(control_sites_data$Trap_Type)
 
-# Mixed effects model for fish abundance within control sites
+# Negative binomial generalized linear mixed model for fish abundance within control sites
 within_control_abundance <- glmmTMB(Total_Number_Fish_by_Trap ~ 
                                      Trap_Type +
                                      (1 | Site),
@@ -1233,8 +1222,6 @@ weight_effects_summary <- pred_grid %>%
     .groups = 'drop'
   )
 
-##Interpretation: trap type is not significant for weight.
-
 ```
 
 ```{r fish length between trap types - control sites only}
@@ -1245,7 +1232,6 @@ weight_effects_summary <- pred_grid %>%
 within_control_length <- lm(log(Fish_Length) ~ 
                              Trap_Type,
                            data = control_fish_data)
-
 
 # Model diagnostics for linear model
 par(mfrow = c(2, 2))
